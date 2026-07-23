@@ -1,0 +1,231 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const rateLimit = require('express-rate-limit');
+const Database = require('better-sqlite3');
+
+// ---------- Required env vars (fail loudly instead of running insecurely) ----------
+const REQUIRED_ENV = ['JWT_SECRET', 'ADMIN_PASSWORD_HASH'];
+for (const key of REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`Missing required env var: ${key}. See .env.example.`);
+    process.exit(1);
+  }
+}
+
+const {
+  JWT_SECRET,
+  ADMIN_PASSWORD_HASH,
+  PORT = 3000,
+  DB_PATH = path.join(__dirname, 'data.db'),
+  FRONTEND_ORIGIN = '', // e.g. https://reshelved.netlify.app - comma-separated if multiple
+  NODE_ENV = 'development'
+} = process.env;
+
+const allowedOrigins = FRONTEND_ORIGIN.split(',').map(s => s.trim()).filter(Boolean);
+
+// ---------- DB ----------
+const db = new Database(DB_PATH);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+  CREATE TABLE IF NOT EXISTS books (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL,
+    category TEXT NOT NULL,
+    condition TEXT NOT NULL,
+    price REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'available',
+    featured INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS sell_leads (
+    id TEXT PRIMARY KEY,
+    title TEXT NOT NULL,
+    author TEXT NOT NULL,
+    condition TEXT NOT NULL,
+    isbn TEXT,
+    notes TEXT,
+    email TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+`);
+
+function newId() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+}
+
+// ---------- App ----------
+const app = express();
+app.set('trust proxy', 1); // Railway sits behind a proxy; needed for correct rate-limit IPs
+
+app.use(express.json({ limit: '100kb' }));
+
+app.use(cors({
+  origin(origin, cb) {
+    // Allow same-origin/non-browser requests (no Origin header) and configured origins.
+    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+      return cb(null, true);
+    }
+    return cb(new Error('Not allowed by CORS'));
+  }
+}));
+
+// No cookies are used for auth, so no `credentials: true` is needed on CORS -
+// this sidesteps the SameSite cross-origin cookie problem entirely.
+
+// ---------- Validation helpers ----------
+const CATEGORIES = ['fiction', 'nonfiction', 'vintage', 'rare'];
+const CONDITIONS = ['like new', 'good', 'well-loved'];
+const SELL_CONDITIONS = ['Like new', 'Good', 'Well-loved', 'Damaged / not sure'];
+
+function isNonEmptyString(v, maxLen = 500) {
+  return typeof v === 'string' && v.trim().length > 0 && v.length <= maxLen;
+}
+
+// ---------- Auth ----------
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many attempts. Try again later.' }
+});
+
+app.post('/api/admin/login', loginLimiter, async (req, res) => {
+  const { passcode } = req.body || {};
+  if (!isNonEmptyString(passcode, 200)) {
+    return res.status(400).json({ error: 'Passcode required.' });
+  }
+  const ok = await bcrypt.compare(passcode, ADMIN_PASSWORD_HASH);
+  if (!ok) {
+    return res.status(401).json({ error: 'Wrong passcode.' });
+  }
+  const token = jwt.sign({ role: 'admin' }, JWT_SECRET, { expiresIn: '12h' });
+  res.json({ token });
+});
+
+function requireAdmin(req, res, next) {
+  const header = req.headers.authorization || '';
+  const [scheme, token] = header.split(' ');
+  if (scheme !== 'Bearer' || !token) {
+    return res.status(401).json({ error: 'Missing admin token.' });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload.role !== 'admin') throw new Error('bad role');
+    next();
+  } catch {
+    return res.status(401).json({ error: 'Invalid or expired token.' });
+  }
+}
+
+// ---------- Public book endpoints ----------
+app.get('/api/books', (req, res) => {
+  const { featured } = req.query;
+  let rows;
+  if (featured === 'true') {
+    rows = db.prepare(`SELECT * FROM books WHERE status = 'available' AND featured = 1 ORDER BY created_at DESC`).all();
+  } else {
+    rows = db.prepare(`SELECT * FROM books WHERE status = 'available' ORDER BY created_at DESC`).all();
+  }
+  res.json(rows);
+});
+
+// ---------- Sell leads (public submit) ----------
+app.post('/api/sell', (req, res) => {
+  const { title, author, condition, isbn, notes, email } = req.body || {};
+
+  if (!isNonEmptyString(title) || !isNonEmptyString(author) || !isNonEmptyString(email, 320)) {
+    return res.status(400).json({ error: 'Title, author, and email are required.' });
+  }
+  if (!SELL_CONDITIONS.includes(condition)) {
+    return res.status(400).json({ error: 'Invalid condition.' });
+  }
+  // Simple email shape check - not exhaustive, just catches obvious junk.
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'Invalid email.' });
+  }
+  if (isbn && typeof isbn !== 'string') return res.status(400).json({ error: 'Invalid ISBN.' });
+  if (notes && (typeof notes !== 'string' || notes.length > 2000)) {
+    return res.status(400).json({ error: 'Notes too long.' });
+  }
+
+  const id = newId();
+  db.prepare(`
+    INSERT INTO sell_leads (id, title, author, condition, isbn, notes, email)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, title.trim(), author.trim(), condition, isbn ? isbn.trim() : null, notes ? notes.trim() : null, email.trim());
+
+  res.status(201).json({ ok: true });
+});
+
+// ---------- Admin: inventory ----------
+app.get('/api/admin/books', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT * FROM books ORDER BY created_at DESC`).all();
+  res.json(rows);
+});
+
+app.post('/api/admin/books', requireAdmin, (req, res) => {
+  const { title, author, category, condition, price, status = 'available', featured = false } = req.body || {};
+
+  if (!isNonEmptyString(title) || !isNonEmptyString(author)) {
+    return res.status(400).json({ error: 'Title and author are required.' });
+  }
+  if (!CATEGORIES.includes(category)) return res.status(400).json({ error: 'Invalid category.' });
+  if (!CONDITIONS.includes(condition)) return res.status(400).json({ error: 'Invalid condition.' });
+  if (typeof price !== 'number' || !Number.isFinite(price) || price < 0) {
+    return res.status(400).json({ error: 'Invalid price.' });
+  }
+  if (!['available', 'sold'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+
+  const id = newId();
+  db.prepare(`
+    INSERT INTO books (id, title, author, category, condition, price, status, featured)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, title.trim(), author.trim(), category, condition, price, status, featured ? 1 : 0);
+
+  res.status(201).json(db.prepare('SELECT * FROM books WHERE id = ?').get(id));
+});
+
+app.patch('/api/admin/books/:id', requireAdmin, (req, res) => {
+  const existing = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Not found.' });
+
+  const { status } = req.body || {};
+  if (!['available', 'sold'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+
+  db.prepare('UPDATE books SET status = ? WHERE id = ?').run(status, req.params.id);
+  res.json(db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id));
+});
+
+app.delete('/api/admin/books/:id', requireAdmin, (req, res) => {
+  const result = db.prepare('DELETE FROM books WHERE id = ?').run(req.params.id);
+  if (result.changes === 0) return res.status(404).json({ error: 'Not found.' });
+  res.status(204).end();
+});
+
+// ---------- Admin: sell leads ----------
+app.get('/api/admin/leads', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT * FROM sell_leads ORDER BY created_at DESC`).all();
+  res.json(rows);
+});
+
+app.get('/api/health', (req, res) => res.json({ ok: true }));
+
+app.use((err, req, res, next) => {
+  if (err.message === 'Not allowed by CORS') {
+    return res.status(403).json({ error: 'Origin not allowed.' });
+  }
+  console.error(err);
+  res.status(500).json({ error: 'Server error.' });
+});
+
+app.listen(PORT, () => {
+  console.log(`reshelved backend listening on :${PORT} (${NODE_ENV})`);
+});
