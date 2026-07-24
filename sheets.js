@@ -27,14 +27,17 @@ if (!sheetsEnabled) {
 }
 
 let cachedSheetsClient = null;
-function getClient() {
+async function getClient() {
   if (!cachedSheetsClient) {
-    const auth = new google.auth.JWT(
-      SERVICE_ACCOUNT_EMAIL,
-      null,
-      PRIVATE_KEY,
-      ['https://www.googleapis.com/auth/spreadsheets']
-    );
+    const auth = new google.auth.JWT({
+      email: SERVICE_ACCOUNT_EMAIL,
+      key: PRIVATE_KEY,
+      scopes: ['https://www.googleapis.com/auth/spreadsheets']
+    });
+    // Force the token fetch now rather than on the first API call, so a bad key
+    // or an unshared sheet fails with a clear error the first time appendRow runs,
+    // not silently on some later call.
+    await auth.authorize();
     cachedSheetsClient = google.sheets({ version: 'v4', auth });
   }
   return cachedSheetsClient;
@@ -45,7 +48,7 @@ function getClient() {
 async function appendRow(tabName, values) {
   if (!sheetsEnabled) return;
   try {
-    const sheets = getClient();
+    const sheets = await getClient();
     await sheets.spreadsheets.values.append({
       spreadsheetId: SHEET_ID,
       range: `${tabName}!A1`,
@@ -57,6 +60,8 @@ async function appendRow(tabName, values) {
     // Swallow errors on purpose - a missing tab, a revoked share, a network blip
     // should never take down the sell/buy-order endpoint that called this.
     console.error(`Google Sheets append to "${tabName}" failed:`, err.message);
+    // A bad key/auth failure gets cached above unless we clear it - retry cleanly next time.
+    cachedSheetsClient = null;
   }
 }
 
