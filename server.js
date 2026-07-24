@@ -37,6 +37,7 @@ db.exec(`
     title TEXT NOT NULL,
     author TEXT NOT NULL,
     category TEXT NOT NULL,
+    subcategory TEXT,
     condition TEXT NOT NULL,
     price REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
@@ -48,6 +49,8 @@ db.exec(`
     id TEXT PRIMARY KEY,
     title TEXT NOT NULL,
     author TEXT NOT NULL,
+    edition TEXT,
+    year_bought TEXT,
     condition TEXT NOT NULL,
     isbn TEXT,
     notes TEXT,
@@ -55,6 +58,23 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
+
+// Migration guard: the two CREATE TABLE statements above only apply to brand-new
+// databases. An already-deployed DB (Railway volume) keeps its existing schema,
+// so add any columns introduced after the first deploy by hand. isbn stays
+// nullable at the DB level even though the API now requires it - SQLite can't
+// add a NOT NULL column without a default to a table that may already have rows,
+// so "required" is enforced in the /api/sell handler instead.
+function ensureColumn(table, column, definition) {
+  try {
+    db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  } catch (e) {
+    if (!/duplicate column name/i.test(e.message)) throw e;
+  }
+}
+ensureColumn('books', 'subcategory', 'TEXT');
+ensureColumn('sell_leads', 'edition', 'TEXT');
+ensureColumn('sell_leads', 'year_bought', 'TEXT');
 
 function newId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -80,12 +100,20 @@ app.use(cors({
 // this sidesteps the SameSite cross-origin cookie problem entirely.
 
 // ---------- Validation helpers ----------
-const CATEGORIES = ['fiction', 'nonfiction', 'vintage', 'rare'];
-const CONDITIONS = ['like new', 'good', 'well-loved'];
-const SELL_CONDITIONS = ['Like new', 'Good', 'Well-loved', 'Damaged / not sure'];
+const CATEGORIES = ['ap', 'hs-coursework', 'act', 'sat', 'nnat-cogat', 'tj', 'general'];
+const GENERAL_SUBCATEGORIES = ['fiction', 'nonfiction', 'kids'];
+const CONDITIONS = ['New', 'Used - Like new', 'Used - Good', 'Used - Fair'];
 
 function isNonEmptyString(v, maxLen = 500) {
   return typeof v === 'string' && v.trim().length > 0 && v.length <= maxLen;
+}
+
+// Structural check only (length + digit shape) - not a full ISBN-10/13 checksum,
+// which would reject real ISBNs on any typo in a way that's hard to recover from.
+function isValidIsbn(v) {
+  if (typeof v !== 'string') return false;
+  const cleaned = v.replace(/[-\s]/g, '');
+  return /^\d{9}[\dXx]$/.test(cleaned) || /^\d{13}$/.test(cleaned);
 }
 
 // ---------- Auth ----------
@@ -139,28 +167,52 @@ app.get('/api/books', (req, res) => {
 
 // ---------- Sell leads (public submit) ----------
 app.post('/api/sell', (req, res) => {
-  const { title, author, condition, isbn, notes, email } = req.body || {};
+  const { title, author, edition, yearBought, condition, isbn, notes, email } = req.body || {};
 
   if (!isNonEmptyString(title) || !isNonEmptyString(author) || !isNonEmptyString(email, 320)) {
     return res.status(400).json({ error: 'Title, author, and email are required.' });
   }
-  if (!SELL_CONDITIONS.includes(condition)) {
+  if (!CONDITIONS.includes(condition)) {
     return res.status(400).json({ error: 'Invalid condition.' });
   }
   // Simple email shape check - not exhaustive, just catches obvious junk.
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: 'Invalid email.' });
   }
-  if (isbn && typeof isbn !== 'string') return res.status(400).json({ error: 'Invalid ISBN.' });
+  if (!isNonEmptyString(isbn, 32) || !isValidIsbn(isbn)) {
+    return res.status(400).json({ error: 'A valid 10- or 13-digit ISBN is required.' });
+  }
+  if (edition && (typeof edition !== 'string' || edition.length > 100)) {
+    return res.status(400).json({ error: 'Edition is too long.' });
+  }
+  let yearBoughtValue = null;
+  if (yearBought !== undefined && yearBought !== null && yearBought !== '') {
+    const yearNum = Number(yearBought);
+    const currentYear = new Date().getFullYear();
+    if (!Number.isInteger(yearNum) || yearNum < 1990 || yearNum > currentYear + 1) {
+      return res.status(400).json({ error: 'Year bought looks invalid.' });
+    }
+    yearBoughtValue = String(yearNum);
+  }
   if (notes && (typeof notes !== 'string' || notes.length > 2000)) {
     return res.status(400).json({ error: 'Notes too long.' });
   }
 
   const id = newId();
   db.prepare(`
-    INSERT INTO sell_leads (id, title, author, condition, isbn, notes, email)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(id, title.trim(), author.trim(), condition, isbn ? isbn.trim() : null, notes ? notes.trim() : null, email.trim());
+    INSERT INTO sell_leads (id, title, author, edition, year_bought, condition, isbn, notes, email)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    title.trim(),
+    author.trim(),
+    edition ? edition.trim() : null,
+    yearBoughtValue,
+    condition,
+    isbn.trim(),
+    notes ? notes.trim() : null,
+    email.trim()
+  );
 
   res.status(201).json({ ok: true });
 });
@@ -172,12 +224,19 @@ app.get('/api/admin/books', requireAdmin, (req, res) => {
 });
 
 app.post('/api/admin/books', requireAdmin, (req, res) => {
-  const { title, author, category, condition, price, status = 'available', featured = false } = req.body || {};
+  const { title, author, category, subcategory, condition, price, status = 'available', featured = false } = req.body || {};
 
   if (!isNonEmptyString(title) || !isNonEmptyString(author)) {
     return res.status(400).json({ error: 'Title and author are required.' });
   }
   if (!CATEGORIES.includes(category)) return res.status(400).json({ error: 'Invalid category.' });
+  let subcategoryValue = null;
+  if (category === 'general') {
+    if (!GENERAL_SUBCATEGORIES.includes(subcategory)) {
+      return res.status(400).json({ error: 'General books need a subcategory (Fiction, Nonfiction, or Kids).' });
+    }
+    subcategoryValue = subcategory;
+  }
   if (!CONDITIONS.includes(condition)) return res.status(400).json({ error: 'Invalid condition.' });
   if (typeof price !== 'number' || !Number.isFinite(price) || price < 0) {
     return res.status(400).json({ error: 'Invalid price.' });
@@ -186,9 +245,9 @@ app.post('/api/admin/books', requireAdmin, (req, res) => {
 
   const id = newId();
   db.prepare(`
-    INSERT INTO books (id, title, author, category, condition, price, status, featured)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, title.trim(), author.trim(), category, condition, price, status, featured ? 1 : 0);
+    INSERT INTO books (id, title, author, category, subcategory, condition, price, status, featured)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, title.trim(), author.trim(), category, subcategoryValue, condition, price, status, featured ? 1 : 0);
 
   res.status(201).json(db.prepare('SELECT * FROM books WHERE id = ?').get(id));
 });

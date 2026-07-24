@@ -12,6 +12,7 @@ db.exec(`
     title TEXT NOT NULL,
     author TEXT NOT NULL,
     category TEXT NOT NULL,
+    subcategory TEXT,
     condition TEXT NOT NULL,
     price REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
@@ -21,22 +22,27 @@ db.exec(`
 `);
 
 const sample = [
-  ['The Left Hand of Darkness', 'Ursula K. Le Guin', 'fiction', 'good', 7.5, 'available', 1],
-  ['A Short History of Nearly Everything', 'Bill Bryson', 'nonfiction', 'like new', 9.0, 'available', 1],
-  ['The Voyage of the Beagle', 'Charles Darwin', 'vintage', 'well-loved', 12.0, 'available', 1],
-  ['Ficciones', 'Jorge Luis Borges', 'fiction', 'good', 8.0, 'available', 0],
-  ['A First Edition Field Guide', 'Anonymous', 'rare', 'good', 45.0, 'available', 0]
+  // title, author, category, subcategory, condition, price, status, featured
+  ['Barron\'s AP Chemistry', 'Neil D. Jespersen', 'ap', null, 'Used - Good', 18.0, 'available', 1],
+  ['Algebra II Coursework Workbook', 'Local HS Dept.', 'hs-coursework', null, 'Used - Like new', 20.0, 'available', 1],
+  ['The Official ACT Prep Guide', 'ACT, Inc.', 'act', null, 'Used - Good', 25.0, 'available', 1],
+  ['The Official SAT Study Guide', 'College Board', 'sat', null, 'Used - Fair', 20.0, 'available', 0],
+  ['NNAT3 Practice Test Workbook', 'TestPrep-Online', 'nnat-cogat', null, 'Used - Like new', 22.0, 'available', 0],
+  ['TJHSST Admissions Prep Packet', 'Anonymous', 'tj', null, 'Used - Good', 15.0, 'available', 0],
+  ['The Left Hand of Darkness', 'Ursula K. Le Guin', 'general', 'fiction', 'Used - Good', 7.5, 'available', 0],
+  ['A Short History of Nearly Everything', 'Bill Bryson', 'general', 'nonfiction', 'Used - Like new', 9.0, 'available', 0],
+  ['Charlotte\'s Web', 'E.B. White', 'general', 'kids', 'Used - Good', 5.0, 'available', 0]
 ];
 
 const insert = db.prepare(`
-  INSERT INTO books (id, title, author, category, condition, price, status, featured)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO books (id, title, author, category, subcategory, condition, price, status, featured)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 const id = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 
-for (const [title, author, category, condition, price, status, featured] of sample) {
-  insert.run(id(), title, author, category, condition, price, status, featured);
+for (const [title, author, category, subcategory, condition, price, status, featured] of sample) {
+  insert.run(id(), title, author, category, subcategory, condition, price, status, featured);
 }
 
 console.log(`Seeded ${sample.length} books into ${DB_PATH}`);
