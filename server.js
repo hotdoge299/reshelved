@@ -6,6 +6,7 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
 const Database = require('better-sqlite3');
+const { appendRow } = require('./sheets');
 
 // ---------- Required env vars (fail loudly instead of running insecurely) ----------
 const REQUIRED_ENV = ['JWT_SECRET', 'ADMIN_PASSWORD_HASH'];
@@ -57,6 +58,22 @@ db.exec(`
     email TEXT NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS buy_orders (
+    id TEXT PRIMARY KEY,
+    title TEXT,
+    isbn TEXT,
+    author TEXT,
+    max_price REAL,
+    needed_by TEXT,
+    notes TEXT,
+    full_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    high_school TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
 // Migration guard: the two CREATE TABLE statements above only apply to brand-new
@@ -103,9 +120,18 @@ app.use(cors({
 const CATEGORIES = ['ap', 'hs-coursework', 'act', 'sat', 'nnat-cogat', 'tj', 'general'];
 const GENERAL_SUBCATEGORIES = ['fiction', 'nonfiction', 'kids'];
 const CONDITIONS = ['New', 'Used - Like new', 'Used - Good', 'Used - Fair'];
+const GRADES = ['K', '1st', '2nd', '3rd', '4th', '5th', '6th', '7th', '8th', '9th', '10th', '11th', '12th', 'Other'];
 
 function isNonEmptyString(v, maxLen = 500) {
   return typeof v === 'string' && v.trim().length > 0 && v.length <= maxLen;
+}
+
+// Loose on purpose - just enough to catch "abc" or a stray sentence, not to
+// enforce a specific country's phone format.
+function isPlausiblePhone(v) {
+  if (typeof v !== 'string') return false;
+  const digits = v.replace(/\D/g, '');
+  return digits.length >= 7 && digits.length <= 15;
 }
 
 // Structural check only (length + digit shape) - not a full ISBN-10/13 checksum,
@@ -153,6 +179,16 @@ function requireAdmin(req, res, next) {
   }
 }
 
+// Public form submissions (Sell, Buy Order) get a looser limiter than admin login -
+// generous enough for a real visitor, tight enough to blunt scripted spam.
+const formLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many submissions from this connection. Try again later.' }
+});
+
 // ---------- Public book endpoints ----------
 app.get('/api/books', (req, res) => {
   const { featured } = req.query;
@@ -166,7 +202,7 @@ app.get('/api/books', (req, res) => {
 });
 
 // ---------- Sell leads (public submit) ----------
-app.post('/api/sell', (req, res) => {
+app.post('/api/sell', formLimiter, (req, res) => {
   const { title, author, edition, yearBought, condition, isbn, notes, email } = req.body || {};
 
   if (!isNonEmptyString(title) || !isNonEmptyString(author) || !isNonEmptyString(email, 320)) {
@@ -213,6 +249,100 @@ app.post('/api/sell', (req, res) => {
     notes ? notes.trim() : null,
     email.trim()
   );
+
+  appendRow('Sell Leads', [
+    new Date().toISOString(),
+    title.trim(),
+    author.trim(),
+    edition ? edition.trim() : '',
+    yearBoughtValue || '',
+    condition,
+    isbn.trim(),
+    notes ? notes.trim() : '',
+    email.trim()
+  ]);
+
+  res.status(201).json({ ok: true });
+});
+
+// ---------- Buy orders (public submit - "can't find it, please source it") ----------
+app.post('/api/buy-order', formLimiter, (req, res) => {
+  const {
+    title, isbn, author, maxPrice, neededBy, notes,
+    fullName, email, phone, grade, highSchool
+  } = req.body || {};
+
+  const hasTitle = isNonEmptyString(title, 300);
+  const hasIsbn = isNonEmptyString(isbn, 32);
+  if (!hasTitle && !hasIsbn) {
+    return res.status(400).json({ error: 'Enter a book title or an ISBN so we know what to look for.' });
+  }
+  if (!isNonEmptyString(fullName, 200)) {
+    return res.status(400).json({ error: 'Full name is required.' });
+  }
+  if (!isNonEmptyString(email, 320) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'A valid email is required.' });
+  }
+  if (!isPlausiblePhone(phone)) {
+    return res.status(400).json({ error: 'A valid phone number is required.' });
+  }
+  if (!GRADES.includes(grade)) {
+    return res.status(400).json({ error: 'Please select the grade being entered.' });
+  }
+  if (!isNonEmptyString(highSchool, 200)) {
+    return res.status(400).json({ error: 'School is required.' });
+  }
+  if (author !== undefined && author !== null && (typeof author !== 'string' || author.length > 200)) {
+    return res.status(400).json({ error: 'Author is too long.' });
+  }
+  let maxPriceValue = null;
+  if (maxPrice !== undefined && maxPrice !== null && maxPrice !== '') {
+    const priceNum = Number(maxPrice);
+    if (!Number.isFinite(priceNum) || priceNum < 0) {
+      return res.status(400).json({ error: 'Max price looks invalid.' });
+    }
+    maxPriceValue = priceNum;
+  }
+  if (neededBy && (typeof neededBy !== 'string' || neededBy.length > 100)) {
+    return res.status(400).json({ error: 'Needed-by is too long.' });
+  }
+  if (notes && (typeof notes !== 'string' || notes.length > 2000)) {
+    return res.status(400).json({ error: 'Notes too long.' });
+  }
+
+  const id = newId();
+  db.prepare(`
+    INSERT INTO buy_orders (id, title, isbn, author, max_price, needed_by, notes, full_name, email, phone, grade, high_school)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    hasTitle ? title.trim() : null,
+    hasIsbn ? isbn.trim() : null,
+    author ? author.trim() : null,
+    maxPriceValue,
+    neededBy ? neededBy.trim() : null,
+    notes ? notes.trim() : null,
+    fullName.trim(),
+    email.trim(),
+    phone.trim(),
+    grade,
+    highSchool.trim()
+  );
+
+  appendRow('Buy Orders', [
+    new Date().toISOString(),
+    hasTitle ? title.trim() : '',
+    hasIsbn ? isbn.trim() : '',
+    author ? author.trim() : '',
+    maxPriceValue !== null ? maxPriceValue : '',
+    neededBy ? neededBy.trim() : '',
+    notes ? notes.trim() : '',
+    fullName.trim(),
+    email.trim(),
+    phone.trim(),
+    grade,
+    highSchool.trim()
+  ]);
 
   res.status(201).json({ ok: true });
 });
@@ -272,6 +402,12 @@ app.delete('/api/admin/books/:id', requireAdmin, (req, res) => {
 // ---------- Admin: sell leads ----------
 app.get('/api/admin/leads', requireAdmin, (req, res) => {
   const rows = db.prepare(`SELECT * FROM sell_leads ORDER BY created_at DESC`).all();
+  res.json(rows);
+});
+
+// ---------- Admin: buy orders ----------
+app.get('/api/admin/buy-orders', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT * FROM buy_orders ORDER BY created_at DESC`).all();
   res.json(rows);
 });
 
