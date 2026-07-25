@@ -56,6 +56,7 @@ db.exec(`
     isbn TEXT,
     notes TEXT,
     email TEXT NOT NULL,
+    phone TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -64,7 +65,6 @@ db.exec(`
     title TEXT,
     isbn TEXT,
     author TEXT,
-    max_price REAL,
     needed_by TEXT,
     notes TEXT,
     full_name TEXT NOT NULL,
@@ -72,6 +72,17 @@ db.exec(`
     phone TEXT NOT NULL,
     grade TEXT NOT NULL,
     high_school TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE TABLE IF NOT EXISTS reservations (
+    id TEXT PRIMARY KEY,
+    full_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT NOT NULL,
+    book_ids TEXT NOT NULL,
+    book_summary TEXT NOT NULL,
+    total REAL NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
@@ -92,6 +103,7 @@ function ensureColumn(table, column, definition) {
 ensureColumn('books', 'subcategory', 'TEXT');
 ensureColumn('sell_leads', 'edition', 'TEXT');
 ensureColumn('sell_leads', 'year_bought', 'TEXT');
+ensureColumn('sell_leads', 'phone', 'TEXT');
 
 function newId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
@@ -203,7 +215,7 @@ app.get('/api/books', (req, res) => {
 
 // ---------- Sell leads (public submit) ----------
 app.post('/api/sell', formLimiter, (req, res) => {
-  const { title, author, edition, yearBought, condition, isbn, notes, email } = req.body || {};
+  const { title, author, edition, yearBought, condition, isbn, notes, email, phone } = req.body || {};
 
   if (!isNonEmptyString(title) || !isNonEmptyString(author) || !isNonEmptyString(email, 320)) {
     return res.status(400).json({ error: 'Title, author, and email are required.' });
@@ -214,6 +226,9 @@ app.post('/api/sell', formLimiter, (req, res) => {
   // Simple email shape check - not exhaustive, just catches obvious junk.
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
     return res.status(400).json({ error: 'Invalid email.' });
+  }
+  if (!isPlausiblePhone(phone)) {
+    return res.status(400).json({ error: 'A valid phone number is required.' });
   }
   if (!isNonEmptyString(isbn, 32) || !isValidIsbn(isbn)) {
     return res.status(400).json({ error: 'A valid 10- or 13-digit ISBN is required.' });
@@ -236,8 +251,8 @@ app.post('/api/sell', formLimiter, (req, res) => {
 
   const id = newId();
   db.prepare(`
-    INSERT INTO sell_leads (id, title, author, edition, year_bought, condition, isbn, notes, email)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO sell_leads (id, title, author, edition, year_bought, condition, isbn, notes, email, phone)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     title.trim(),
@@ -247,7 +262,8 @@ app.post('/api/sell', formLimiter, (req, res) => {
     condition,
     isbn.trim(),
     notes ? notes.trim() : null,
-    email.trim()
+    email.trim(),
+    phone.trim()
   );
 
   appendRow('Sell Leads', [
@@ -259,7 +275,8 @@ app.post('/api/sell', formLimiter, (req, res) => {
     condition,
     isbn.trim(),
     notes ? notes.trim() : '',
-    email.trim()
+    email.trim(),
+    phone.trim()
   ]);
 
   res.status(201).json({ ok: true });
@@ -268,7 +285,7 @@ app.post('/api/sell', formLimiter, (req, res) => {
 // ---------- Buy orders (public submit - "can't find it, please source it") ----------
 app.post('/api/buy-order', formLimiter, (req, res) => {
   const {
-    title, isbn, author, maxPrice, neededBy, notes,
+    title, isbn, author, neededBy, notes,
     fullName, email, phone, grade, highSchool
   } = req.body || {};
 
@@ -276,6 +293,9 @@ app.post('/api/buy-order', formLimiter, (req, res) => {
   const hasIsbn = isNonEmptyString(isbn, 32);
   if (!hasTitle && !hasIsbn) {
     return res.status(400).json({ error: 'Enter a book title or an ISBN so we know what to look for.' });
+  }
+  if (!isNonEmptyString(author, 200)) {
+    return res.status(400).json({ error: 'Author is required.' });
   }
   if (!isNonEmptyString(fullName, 200)) {
     return res.status(400).json({ error: 'Full name is required.' });
@@ -292,17 +312,6 @@ app.post('/api/buy-order', formLimiter, (req, res) => {
   if (!isNonEmptyString(highSchool, 200)) {
     return res.status(400).json({ error: 'School is required.' });
   }
-  if (author !== undefined && author !== null && (typeof author !== 'string' || author.length > 200)) {
-    return res.status(400).json({ error: 'Author is too long.' });
-  }
-  let maxPriceValue = null;
-  if (maxPrice !== undefined && maxPrice !== null && maxPrice !== '') {
-    const priceNum = Number(maxPrice);
-    if (!Number.isFinite(priceNum) || priceNum < 0) {
-      return res.status(400).json({ error: 'Max price looks invalid.' });
-    }
-    maxPriceValue = priceNum;
-  }
   if (neededBy && (typeof neededBy !== 'string' || neededBy.length > 100)) {
     return res.status(400).json({ error: 'Needed-by is too long.' });
   }
@@ -312,14 +321,13 @@ app.post('/api/buy-order', formLimiter, (req, res) => {
 
   const id = newId();
   db.prepare(`
-    INSERT INTO buy_orders (id, title, isbn, author, max_price, needed_by, notes, full_name, email, phone, grade, high_school)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO buy_orders (id, title, isbn, author, needed_by, notes, full_name, email, phone, grade, high_school)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
     id,
     hasTitle ? title.trim() : null,
     hasIsbn ? isbn.trim() : null,
-    author ? author.trim() : null,
-    maxPriceValue,
+    author.trim(),
     neededBy ? neededBy.trim() : null,
     notes ? notes.trim() : null,
     fullName.trim(),
@@ -333,8 +341,7 @@ app.post('/api/buy-order', formLimiter, (req, res) => {
     new Date().toISOString(),
     hasTitle ? title.trim() : '',
     hasIsbn ? isbn.trim() : '',
-    author ? author.trim() : '',
-    maxPriceValue !== null ? maxPriceValue : '',
+    author.trim(),
     neededBy ? neededBy.trim() : '',
     notes ? notes.trim() : '',
     fullName.trim(),
@@ -345,6 +352,83 @@ app.post('/api/buy-order', formLimiter, (req, res) => {
   ]);
 
   res.status(201).json({ ok: true });
+});
+
+// ---------- Reservations (public checkout - "reserve & hold" from the cart) ----------
+app.post('/api/reserve', formLimiter, (req, res) => {
+  const { bookIds, fullName, email, phone } = req.body || {};
+
+  if (!Array.isArray(bookIds) || bookIds.length === 0 || bookIds.length > 50 || !bookIds.every(id => typeof id === 'string' && id.length <= 64)) {
+    return res.status(400).json({ error: 'No books selected to reserve.' });
+  }
+  if (!isNonEmptyString(fullName, 200)) {
+    return res.status(400).json({ error: 'Full name is required.' });
+  }
+  if (!isNonEmptyString(email, 320) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'A valid email is required.' });
+  }
+  if (!isPlausiblePhone(phone)) {
+    return res.status(400).json({ error: 'A valid phone number is required.' });
+  }
+
+  // Dedupe defensively - a repeated id in the payload would otherwise double-reserve/double-count.
+  const uniqueIds = [...new Set(bookIds)];
+
+  // Everything below happens in one transaction so two people checking out the
+  // same copy at the same moment can't both "win" it.
+  const reserveTx = db.transaction((ids) => {
+    const reserved = [];
+    const unavailable = [];
+    for (const id of ids) {
+      const book = db.prepare(`SELECT * FROM books WHERE id = ?`).get(id);
+      if (!book || book.status !== 'available') {
+        unavailable.push(id);
+        continue;
+      }
+      const result = db.prepare(`UPDATE books SET status = 'reserved' WHERE id = ? AND status = 'available'`).run(id);
+      if (result.changes === 1) {
+        reserved.push(book);
+      } else {
+        unavailable.push(id); // lost a race with another checkout between the SELECT and UPDATE
+      }
+    }
+    return { reserved, unavailable };
+  });
+
+  const { reserved, unavailable } = reserveTx(uniqueIds);
+
+  if (reserved.length === 0) {
+    return res.status(409).json({ error: 'Sorry, those were just reserved by someone else. Refresh the page and try again.' });
+  }
+
+  const total = reserved.reduce((sum, b) => sum + Number(b.price), 0);
+  const summary = reserved.map(b => ({ title: b.title, author: b.author, condition: b.condition, price: b.price }));
+
+  const id = newId();
+  db.prepare(`
+    INSERT INTO reservations (id, full_name, email, phone, book_ids, book_summary, total)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(id, fullName.trim(), email.trim(), phone.trim(), JSON.stringify(reserved.map(b => b.id)), JSON.stringify(summary), total);
+
+  reserved.forEach(book => {
+    appendRow('Reserved', [
+      new Date().toISOString(),
+      book.title,
+      book.author,
+      book.condition,
+      Number(book.price).toFixed(2),
+      fullName.trim(),
+      email.trim(),
+      phone.trim()
+    ]);
+  });
+
+  res.status(201).json({
+    ok: true,
+    reservedCount: reserved.length,
+    unavailable,
+    total
+  });
 });
 
 // ---------- Admin: inventory ----------
@@ -387,7 +471,7 @@ app.patch('/api/admin/books/:id', requireAdmin, (req, res) => {
   if (!existing) return res.status(404).json({ error: 'Not found.' });
 
   const { status } = req.body || {};
-  if (!['available', 'sold'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+  if (!['available', 'sold', 'reserved'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
 
   db.prepare('UPDATE books SET status = ? WHERE id = ?').run(status, req.params.id);
   res.json(db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id));
