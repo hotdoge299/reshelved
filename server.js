@@ -2,9 +2,11 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const path = require('path');
+const fs = require('fs');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const rateLimit = require('express-rate-limit');
+const multer = require('multer');
 const Database = require('better-sqlite3');
 const { appendRow } = require('./sheets');
 
@@ -22,7 +24,7 @@ const {
   ADMIN_PASSWORD_HASH,
   PORT = 3000,
   DB_PATH = path.join(__dirname, 'data.db'),
-  FRONTEND_ORIGIN = '', // e.g. https://reshelved.netlify.app - comma-separated if multiple
+  FRONTEND_ORIGIN = '', // e.g. https://nova-selfstudy.netlify.app - comma-separated if multiple
   NODE_ENV = 'development'
 } = process.env;
 
@@ -43,6 +45,7 @@ db.exec(`
     price REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
     featured INTEGER NOT NULL DEFAULT 0,
+    image_url TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 
@@ -62,9 +65,13 @@ db.exec(`
 
   CREATE TABLE IF NOT EXISTS buy_orders (
     id TEXT PRIMARY KEY,
+    request_type TEXT NOT NULL DEFAULT 'specific',
     title TEXT,
     isbn TEXT,
     author TEXT,
+    subject_category TEXT,
+    subject_subcategory TEXT,
+    subject_detail TEXT,
     needed_by TEXT,
     notes TEXT,
     full_name TEXT NOT NULL,
@@ -85,14 +92,23 @@ db.exec(`
     total REAL NOT NULL,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
+
+  CREATE TABLE IF NOT EXISTS contacts (
+    id TEXT PRIMARY KEY,
+    full_name TEXT NOT NULL,
+    email TEXT NOT NULL,
+    phone TEXT,
+    message TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  );
 `);
 
-// Migration guard: the two CREATE TABLE statements above only apply to brand-new
+// Migration guard: the CREATE TABLE statements above only apply to brand-new
 // databases. An already-deployed DB (Railway volume) keeps its existing schema,
 // so add any columns introduced after the first deploy by hand. isbn stays
 // nullable at the DB level even though the API now requires it - SQLite can't
 // add a NOT NULL column without a default to a table that may already have rows,
-// so "required" is enforced in the /api/sell handler instead.
+// so "required" is enforced in the relevant handler instead.
 function ensureColumn(table, column, definition) {
   try {
     db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
@@ -101,13 +117,45 @@ function ensureColumn(table, column, definition) {
   }
 }
 ensureColumn('books', 'subcategory', 'TEXT');
+ensureColumn('books', 'image_url', 'TEXT');
 ensureColumn('sell_leads', 'edition', 'TEXT');
 ensureColumn('sell_leads', 'year_bought', 'TEXT');
 ensureColumn('sell_leads', 'phone', 'TEXT');
+// Existing buy_orders rows predate the two-panel split - they were all
+// effectively "I know the exact book" requests, so backfill them as 'specific'.
+ensureColumn('buy_orders', 'request_type', "TEXT NOT NULL DEFAULT 'specific'");
+ensureColumn('buy_orders', 'subject_category', 'TEXT');
+ensureColumn('buy_orders', 'subject_subcategory', 'TEXT');
+ensureColumn('buy_orders', 'subject_detail', 'TEXT');
+
+// Uploaded book photos live next to the SQLite file - same directory, so on
+// Railway they land on the same mounted volume and survive redeploys exactly
+// like the DB does.
+const UPLOAD_DIR = path.join(path.dirname(DB_PATH), 'uploads');
+fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
 function newId() {
   return Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
 }
+
+// ---------- Image uploads (book photos) ----------
+const ALLOWED_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/gif'];
+const imageUpload = multer({
+  storage: multer.diskStorage({
+    destination: (req, file, cb) => cb(null, UPLOAD_DIR),
+    filename: (req, file, cb) => {
+      const ext = path.extname(file.originalname || '').toLowerCase();
+      cb(null, `${newId()}${ext}`);
+    }
+  }),
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5MB
+  fileFilter: (req, file, cb) => {
+    if (!ALLOWED_IMAGE_TYPES.includes(file.mimetype)) {
+      return cb(new Error('Only JPEG, PNG, WEBP, or GIF images are allowed.'));
+    }
+    cb(null, true);
+  }
+});
 
 // ---------- App ----------
 const app = express();
@@ -127,6 +175,10 @@ app.use(cors({
 
 // No cookies are used for auth, so no `credentials: true` is needed on CORS -
 // this sidesteps the SameSite cross-origin cookie problem entirely.
+
+// <img> tags load cross-origin without needing CORS headers (that only applies
+// to script-readable fetches), so this can just be a plain static mount.
+app.use('/uploads', express.static(UPLOAD_DIR));
 
 // ---------- Validation helpers ----------
 const CATEGORIES = ['ap', 'hs-coursework', 'act', 'sat', 'nnat-cogat', 'tj', 'general'];
@@ -283,20 +335,22 @@ app.post('/api/sell', formLimiter, (req, res) => {
 });
 
 // ---------- Buy orders (public submit - "can't find it, please source it") ----------
+// Two request types from the two-panel form on the frontend:
+//   'specific' - visitor knows exactly which book (ISBN required, so we can be
+//                sure we're sourcing the right edition, not just something close)
+//   'subject'  - visitor just needs *something* for a subject/grade, no exact book in mind
 app.post('/api/buy-order', formLimiter, (req, res) => {
   const {
-    title, isbn, author, neededBy, notes,
-    fullName, email, phone, grade, highSchool
+    requestType, title, isbn, author,
+    subjectCategory, subjectSubcategory, subjectDetail,
+    neededBy, notes, fullName, email, phone, grade, highSchool
   } = req.body || {};
 
-  const hasTitle = isNonEmptyString(title, 300);
-  const hasIsbn = isNonEmptyString(isbn, 32);
-  if (!hasTitle && !hasIsbn) {
-    return res.status(400).json({ error: 'Enter a book title or an ISBN so we know what to look for.' });
+  if (!['specific', 'subject'].includes(requestType)) {
+    return res.status(400).json({ error: 'Invalid request type.' });
   }
-  if (!isNonEmptyString(author, 200)) {
-    return res.status(400).json({ error: 'Author is required.' });
-  }
+
+  // Shared fields, required either way.
   if (!isNonEmptyString(fullName, 200)) {
     return res.status(400).json({ error: 'Full name is required.' });
   }
@@ -319,29 +373,61 @@ app.post('/api/buy-order', formLimiter, (req, res) => {
     return res.status(400).json({ error: 'Notes too long.' });
   }
 
+  let titleValue = null, isbnValue = null, authorValue = null;
+  let subjectCategoryValue = null, subjectSubcategoryValue = null, subjectDetailValue = null;
+
+  if (requestType === 'specific') {
+    if (!isNonEmptyString(isbn, 32) || !isValidIsbn(isbn)) {
+      return res.status(400).json({ error: 'A valid 10- or 13-digit ISBN is required.' });
+    }
+    if (!isNonEmptyString(author, 200)) {
+      return res.status(400).json({ error: 'Author is required.' });
+    }
+    isbnValue = isbn.trim();
+    authorValue = author.trim();
+    if (isNonEmptyString(title, 300)) titleValue = title.trim();
+  } else {
+    if (!CATEGORIES.includes(subjectCategory)) {
+      return res.status(400).json({ error: 'Please select a subject.' });
+    }
+    subjectCategoryValue = subjectCategory;
+    if (subjectCategory === 'general') {
+      if (!GENERAL_SUBCATEGORIES.includes(subjectSubcategory)) {
+        return res.status(400).json({ error: 'Please select a subcategory (Fiction, Nonfiction, or Kids).' });
+      }
+      subjectSubcategoryValue = subjectSubcategory;
+    }
+    if (subjectDetail && (typeof subjectDetail !== 'string' || subjectDetail.length > 200)) {
+      return res.status(400).json({ error: 'Subject detail is too long.' });
+    }
+    if (isNonEmptyString(subjectDetail, 200)) subjectDetailValue = subjectDetail.trim();
+  }
+
   const id = newId();
   db.prepare(`
-    INSERT INTO buy_orders (id, title, isbn, author, needed_by, notes, full_name, email, phone, grade, high_school)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO buy_orders (
+      id, request_type, title, isbn, author,
+      subject_category, subject_subcategory, subject_detail,
+      needed_by, notes, full_name, email, phone, grade, high_school
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
-    id,
-    hasTitle ? title.trim() : null,
-    hasIsbn ? isbn.trim() : null,
-    author.trim(),
+    id, requestType, titleValue, isbnValue, authorValue,
+    subjectCategoryValue, subjectSubcategoryValue, subjectDetailValue,
     neededBy ? neededBy.trim() : null,
     notes ? notes.trim() : null,
-    fullName.trim(),
-    email.trim(),
-    phone.trim(),
-    grade,
-    highSchool.trim()
+    fullName.trim(), email.trim(), phone.trim(), grade, highSchool.trim()
   );
 
   appendRow('Buy Orders', [
     new Date().toISOString(),
-    hasTitle ? title.trim() : '',
-    hasIsbn ? isbn.trim() : '',
-    author.trim(),
+    requestType,
+    titleValue || '',
+    isbnValue || '',
+    authorValue || '',
+    subjectCategoryValue || '',
+    subjectSubcategoryValue || '',
+    subjectDetailValue || '',
     neededBy ? neededBy.trim() : '',
     notes ? notes.trim() : '',
     fullName.trim(),
@@ -431,6 +517,50 @@ app.post('/api/reserve', formLimiter, (req, res) => {
   });
 });
 
+// ---------- Contact (public submit) ----------
+app.post('/api/contact', formLimiter, (req, res) => {
+  const { fullName, email, phone, message } = req.body || {};
+
+  if (!isNonEmptyString(fullName, 200)) {
+    return res.status(400).json({ error: 'Full name is required.' });
+  }
+  if (!isNonEmptyString(email, 320) || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+    return res.status(400).json({ error: 'A valid email is required.' });
+  }
+  if (phone && !isPlausiblePhone(phone)) {
+    return res.status(400).json({ error: 'That phone number doesn\'t look right.' });
+  }
+  if (!isNonEmptyString(message, 3000)) {
+    return res.status(400).json({ error: 'Message is required.' });
+  }
+
+  const id = newId();
+  db.prepare(`
+    INSERT INTO contacts (id, full_name, email, phone, message)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(id, fullName.trim(), email.trim(), phone ? phone.trim() : null, message.trim());
+
+  appendRow('Contact', [
+    new Date().toISOString(),
+    fullName.trim(),
+    email.trim(),
+    phone ? phone.trim() : '',
+    message.trim()
+  ]);
+
+  res.status(201).json({ ok: true });
+});
+
+// ---------- Admin: image uploads ----------
+app.post('/api/admin/upload-image', requireAdmin, (req, res) => {
+  imageUpload.single('image')(req, res, (err) => {
+    if (err) return res.status(400).json({ error: err.message });
+    if (!req.file) return res.status(400).json({ error: 'No image uploaded.' });
+    const imageUrl = `${req.protocol}://${req.get('host')}/uploads/${req.file.filename}`;
+    res.status(201).json({ imageUrl });
+  });
+});
+
 // ---------- Admin: inventory ----------
 app.get('/api/admin/books', requireAdmin, (req, res) => {
   const rows = db.prepare(`SELECT * FROM books ORDER BY created_at DESC`).all();
@@ -438,7 +568,7 @@ app.get('/api/admin/books', requireAdmin, (req, res) => {
 });
 
 app.post('/api/admin/books', requireAdmin, (req, res) => {
-  const { title, author, category, subcategory, condition, price, status = 'available', featured = false } = req.body || {};
+  const { title, author, category, subcategory, condition, price, status = 'available', featured = false, imageUrl } = req.body || {};
 
   if (!isNonEmptyString(title) || !isNonEmptyString(author)) {
     return res.status(400).json({ error: 'Title and author are required.' });
@@ -456,12 +586,19 @@ app.post('/api/admin/books', requireAdmin, (req, res) => {
     return res.status(400).json({ error: 'Invalid price.' });
   }
   if (!['available', 'sold'].includes(status)) return res.status(400).json({ error: 'Invalid status.' });
+  let imageUrlValue = null;
+  if (imageUrl !== undefined && imageUrl !== null && imageUrl !== '') {
+    if (typeof imageUrl !== 'string' || imageUrl.length > 2000) {
+      return res.status(400).json({ error: 'Invalid image URL.' });
+    }
+    imageUrlValue = imageUrl.trim();
+  }
 
   const id = newId();
   db.prepare(`
-    INSERT INTO books (id, title, author, category, subcategory, condition, price, status, featured)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).run(id, title.trim(), author.trim(), category, subcategoryValue, condition, price, status, featured ? 1 : 0);
+    INSERT INTO books (id, title, author, category, subcategory, condition, price, status, featured, image_url)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(id, title.trim(), author.trim(), category, subcategoryValue, condition, price, status, featured ? 1 : 0, imageUrlValue);
 
   res.status(201).json(db.prepare('SELECT * FROM books WHERE id = ?').get(id));
 });
@@ -477,9 +614,77 @@ app.patch('/api/admin/books/:id', requireAdmin, (req, res) => {
   res.json(db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id));
 });
 
+// Full edit - separate from the PATCH above (which only flips status for the
+// quick Mark sold/Release buttons). This is what the admin "Edit" button uses
+// to change title/author/category/condition/price/photo/etc. on an existing listing.
+app.put('/api/admin/books/:id', requireAdmin, (req, res) => {
+  const existing = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
+  if (!existing) return res.status(404).json({ error: 'Not found.' });
+
+  const { title, author, category, subcategory, condition, price, status, featured, imageUrl } = req.body || {};
+
+  if (!isNonEmptyString(title) || !isNonEmptyString(author)) {
+    return res.status(400).json({ error: 'Title and author are required.' });
+  }
+  if (!CATEGORIES.includes(category)) return res.status(400).json({ error: 'Invalid category.' });
+  let subcategoryValue = null;
+  if (category === 'general') {
+    if (!GENERAL_SUBCATEGORIES.includes(subcategory)) {
+      return res.status(400).json({ error: 'General books need a subcategory (Fiction, Nonfiction, or Kids).' });
+    }
+    subcategoryValue = subcategory;
+  }
+  if (!CONDITIONS.includes(condition)) return res.status(400).json({ error: 'Invalid condition.' });
+  if (typeof price !== 'number' || !Number.isFinite(price) || price < 0) {
+    return res.status(400).json({ error: 'Invalid price.' });
+  }
+  if (!['available', 'sold', 'reserved'].includes(status)) {
+    return res.status(400).json({ error: 'Invalid status.' });
+  }
+
+  // imageUrl is optional on an edit - omit it entirely to keep the existing photo,
+  // send '' or null to clear it, or send a fresh /uploads/... URL to replace it.
+  let imageUrlValue = existing.image_url;
+  if (imageUrl !== undefined) {
+    if (imageUrl === null || imageUrl === '') {
+      imageUrlValue = null;
+    } else if (typeof imageUrl === 'string' && imageUrl.length <= 2000) {
+      imageUrlValue = imageUrl.trim();
+    } else {
+      return res.status(400).json({ error: 'Invalid image URL.' });
+    }
+  }
+
+  // Clean up the old uploaded file if it's being replaced or cleared and was one of ours.
+  if (imageUrlValue !== existing.image_url && existing.image_url && existing.image_url.includes('/uploads/')) {
+    const filename = existing.image_url.split('/uploads/').pop();
+    if (filename && !filename.includes('/') && !filename.includes('..')) {
+      fs.unlink(path.join(UPLOAD_DIR, filename), () => {});
+    }
+  }
+
+  db.prepare(`
+    UPDATE books SET title = ?, author = ?, category = ?, subcategory = ?, condition = ?, price = ?, status = ?, featured = ?, image_url = ?
+    WHERE id = ?
+  `).run(title.trim(), author.trim(), category, subcategoryValue, condition, price, status, featured ? 1 : 0, imageUrlValue, req.params.id);
+
+  res.json(db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id));
+});
+
 app.delete('/api/admin/books/:id', requireAdmin, (req, res) => {
+  const existing = db.prepare('SELECT * FROM books WHERE id = ?').get(req.params.id);
   const result = db.prepare('DELETE FROM books WHERE id = ?').run(req.params.id);
   if (result.changes === 0) return res.status(404).json({ error: 'Not found.' });
+
+  // Best-effort cleanup of an uploaded photo, if this book had one of ours
+  // (not some external URL an admin might have pasted in some other way).
+  if (existing && existing.image_url && existing.image_url.includes('/uploads/')) {
+    const filename = existing.image_url.split('/uploads/').pop();
+    if (filename && !filename.includes('/') && !filename.includes('..')) {
+      fs.unlink(path.join(UPLOAD_DIR, filename), () => {}); // ignore errors - not worth failing the delete over
+    }
+  }
+
   res.status(204).end();
 });
 
@@ -495,6 +700,12 @@ app.get('/api/admin/buy-orders', requireAdmin, (req, res) => {
   res.json(rows);
 });
 
+// ---------- Admin: contact submissions ----------
+app.get('/api/admin/contacts', requireAdmin, (req, res) => {
+  const rows = db.prepare(`SELECT * FROM contacts ORDER BY created_at DESC`).all();
+  res.json(rows);
+});
+
 app.get('/api/health', (req, res) => res.json({ ok: true }));
 
 app.use((err, req, res, next) => {
@@ -506,5 +717,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`reshelved backend listening on :${PORT} (${NODE_ENV})`);
+  console.log(`NOVA-selfstudy backend listening on :${PORT} (${NODE_ENV})`);
 });

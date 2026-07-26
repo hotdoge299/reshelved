@@ -17,6 +17,7 @@ db.exec(`
     price REAL NOT NULL,
     status TEXT NOT NULL DEFAULT 'available',
     featured INTEGER NOT NULL DEFAULT 0,
+    image_url TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
   );
 `);
