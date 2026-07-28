@@ -1,7 +1,7 @@
 {
-  "name": "nova-selfstudy-backend",
+  "name": "justselfstudy-backend",
   "version": "1.0.0",
-  "description": "API for NOVA-selfstudy - books inventory, sell leads, admin auth",
+  "description": "API for justselfstudy - books inventory, sell leads, admin auth",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",

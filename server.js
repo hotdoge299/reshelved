@@ -24,7 +24,7 @@ const {
   ADMIN_PASSWORD_HASH,
   PORT = 3000,
   DB_PATH = path.join(__dirname, 'data.db'),
-  FRONTEND_ORIGIN = '', // e.g. https://nova-selfstudy.netlify.app - comma-separated if multiple
+  FRONTEND_ORIGIN = '', // e.g. https://justselfstudy.netlify.app - comma-separated if multiple
   NODE_ENV = 'development'
 } = process.env;
 
@@ -717,5 +717,5 @@ app.use((err, req, res, next) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`NOVA-selfstudy backend listening on :${PORT} (${NODE_ENV})`);
+  console.log(`justselfstudy backend listening on :${PORT} (${NODE_ENV})`);
 });
